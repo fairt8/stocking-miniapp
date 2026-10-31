@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<title>Stocking signals</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header id="top"><div class="brand">📈 Stocking</div><div id="updated" class="mut small"></div></header>
+<main id="view"><div class="card mut">Loading…</div></main>
+<footer id="disc" class="mut small"></footer>
+<nav id="tabs">
+  <a data-tab="signals" href="#/signals"><span>📋</span>Signals</a>
+  <a data-tab="pnl" href="#/pnl"><span>💰</span>PnL</a>
+  <a data-tab="markets" href="#/markets"><span>🌍</span>Markets</a>
+  <a data-tab="backtest" href="#/backtest"><span>🧪</span>Backtest</a>
+  <a data-tab="actions" href="#/actions"><span>⚡</span>Actions</a>
+</nav>
+<script src="app.js"></script>
+</body>
+</html>

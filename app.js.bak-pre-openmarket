@@ -1,0 +1,345 @@
+/* Stocking Telegram Mini App – static, reads data/*.json published by the box. */
+'use strict';
+const tg = window.Telegram && window.Telegram.WebApp;
+const inTG = !!(tg && tg.initData);
+const D = {};               // loaded data
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const LS = { get(k, d) { try { return JSON.parse(localStorage.getItem('stk_' + k)) ?? d; } catch (e) { return d; } },
+             set(k, v) { try { localStorage.setItem('stk_' + k, JSON.stringify(v)); } catch (e) {} } };
+const TZ = 'Africa/Lagos';
+const fmtT = (iso, opt) => new Intl.DateTimeFormat('en-GB', Object.assign({ timeZone: TZ, weekday: 'short', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false }, opt || {})).format(new Date(iso)) + ' WAT';
+const lagosDate = d => new Intl.DateTimeFormat('en-CA', { timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(d);
+const num = (v, d = 2) => v == null || isNaN(v) ? '–' : Number(v).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
+const px = v => v == null ? '–' : (Math.abs(v) >= 1000 ? num(v, 0) : Math.abs(v) >= 100 ? num(v, 2) : num(v, Math.abs(v) < 1 ? 4 : 2));
+const usd = v => v == null ? '–' : (v >= 0 ? '+$' : '−$') + num(Math.abs(v), 2);
+const sgn = (v, d = 2, suf = '') => v == null ? '–' : (v >= 0 ? '+' : '−') + num(Math.abs(v), d) + suf;
+const cls = v => v == null ? '' : v >= 0 ? 'up' : 'dn';
+const ago = iso => { const m = (Date.now() - new Date(iso)) / 60000; return m < 60 ? Math.round(m) + ' min ago' : m < 2880 ? Math.round(m / 60) + ' h ago' : Math.round(m / 1440) + ' d ago'; };
+const until = iso => { const m = (new Date(iso) - Date.now()) / 60000; return m < 60 ? 'in ' + Math.max(0, Math.round(m)) + ' min' : m < 2880 ? 'in ' + Math.floor(m / 60) + ' h ' + Math.round(m % 60) + ' m' : 'in ' + Math.round(m / 1440) + ' d'; };
+
+/* ---------------- Telegram integration ---------------- */
+if (tg) {
+  tg.ready(); tg.expand();
+  try { tg.setHeaderColor('secondary_bg_color'); } catch (e) {}
+  tg.onEvent('themeChanged', () => { if (location.hash.startsWith('#/s/')) render(); });
+}
+let mainBtnHandler = null;
+function mainButton(text, fn) {
+  if (!tg || !tg.MainButton) return;
+  if (mainBtnHandler) tg.MainButton.offClick(mainBtnHandler);
+  mainBtnHandler = null;
+  if (!text) { tg.MainButton.hide(); return; }
+  mainBtnHandler = fn; tg.MainButton.setText(text); tg.MainButton.onClick(fn); tg.MainButton.show();
+}
+function backButton(show) {
+  if (!tg || !tg.BackButton) return;
+  show ? tg.BackButton.show() : tg.BackButton.hide();
+}
+if (tg && tg.BackButton) tg.BackButton.onClick(() => { history.length > 1 ? history.back() : (location.hash = '#/signals'); });
+
+const ALLOWED = ['scan', 'check', 'sub', 'unsub', 'signals', 'pnl', 'trades', 'status', 'markets', 'help'];
+function encodeCmd(cmd) {           // "/check 7203.T" -> "check_7203_T", "/scan US UK" -> "scan_US-UK"
+  const [c, ...a] = cmd.trim().replace(/^\//, '').split(/\s+/);
+  const v = { subscribe: 'sub', unsubscribe: 'unsub' }[c] || c;
+  const args = a.map(x => x.replace(/[^A-Za-z0-9.\-]/g, '').replace(/\./g, '_'));
+  const p = args.length ? v + '_' + args.join(v === 'check' ? '' : '-') : v;
+  return p.slice(0, 64);
+}
+function haptic(t) { try { tg && tg.HapticFeedback && tg.HapticFeedback.impactOccurred(t || 'light'); } catch (e) {} }
+function botCmd(cmd) {
+  haptic('medium');
+  const bot = (D.status && D.status.bot_username) || 'StockingTradeBot';
+  // sendData only works when the app was opened from the bot's keyboard button (no query_id)
+  if (inTG && !tg.initDataUnsafe.query_id && tg.sendData) {
+    try { tg.sendData(JSON.stringify({ cmd })); return; } catch (e) {}
+  }
+  const url = `https://t.me/${bot}?start=${encodeCmd(cmd)}`;
+  if (inTG && tg.openTelegramLink) tg.openTelegramLink(url);
+  else window.open(url, '_blank');
+}
+function toast(msg) {
+  if (tg && tg.showPopup && inTG) { try { return tg.showAlert(msg); } catch (e) {} }
+  const d = document.createElement('div'); d.className = 'card'; d.style.cssText = 'position:fixed;left:10px;right:10px;bottom:70px;z-index:9';
+  d.textContent = msg; document.body.appendChild(d); setTimeout(() => d.remove(), 2500);
+}
+
+/* ---------------- data ---------------- */
+async function load() {
+  const t = Date.now();
+  const names = ['status', 'signals', 'pnl', 'trades', 'schedule', 'backtest'];
+  await Promise.all(names.map(n => fetch(`data/${n}.json?t=${t}`).then(r => r.ok ? r.json() : null).then(j => D[n] = j).catch(() => D[n] = null)));
+  if (!D.status) throw new Error('data not published yet');
+  $('#updated').textContent = 'Updated ' + ago(D.status.generated_at);
+  $('#updated').title = fmtT(D.status.generated_at);
+  $('#disc').innerHTML = '⚠️ ' + esc(D.status.disclaimer) + ' Data: ' + esc(D.status.data_source) + '. Paper-trade PnL is hypothetical.';
+}
+const M = () => (D.status && D.status.markets) || {};
+const REGIONS = ['Americas', 'Europe', 'Asia-Pacific'];
+function marketMatch(code, f) {
+  if (!f || f === 'all') return true;
+  if (REGIONS.includes(f)) return (M()[code] || {}).region === f;
+  return code === f;
+}
+function marketOptions(sel, withRegions = true) {
+  let h = `<option value="all">All markets</option>`;
+  if (withRegions) h += REGIONS.map(r => `<option value="${r}" ${sel === r ? 'selected' : ''}>${r === 'Americas' ? '🌎' : r === 'Europe' ? '🌍' : '🌏'} ${r}</option>`).join('');
+  h += Object.values(M()).map(m => `<option value="${m.code}" ${sel === m.code ? 'selected' : ''}>${m.flag} ${m.code} – ${esc(m.name)}</option>`).join('');
+  return h;
+}
+
+/* ---------------- views ---------------- */
+const F = Object.assign({ market: 'all', tier: 'all', action: 'all', conf: 0, ck: 0, days: 7, q: '', sort: 'conf' }, LS.get('filters', {}));
+function viewSignals() {
+  const now = Date.now();
+  let rows = (D.signals || []).filter(s => marketMatch(s.market, F.market) && (F.action === 'all' || s.action === F.action) &&
+    (F.tier === 'all' || (F.tier === 'primary' ? s.tier === 'PRIMARY' : s.setup === F.tier)) &&
+    s.confidence >= F.conf && (s.checklist_pass || 0) >= F.ck && (now - new Date(s.ts)) / 864e5 <= F.days &&
+    (!F.q || (s.ticker + ' ' + (s.name || '')).toLowerCase().includes(F.q.toLowerCase())));
+  const pr = s => s.tier === 'PRIMARY' ? 0 : 1;
+  rows.sort(F.sort === 'new' ? (a, b) => b.ts.localeCompare(a.ts) || b.confidence - a.confidence : (a, b) => pr(a) - pr(b) || b.confidence - a.confidence || b.ts.localeCompare(a.ts));
+  const nb = rows.filter(r => r.action === 'BUY').length, ns = rows.length - nb;
+  const segs = (k, opts) => `<div class="seg">${opts.map(([v, l]) => `<button data-f="${k}" data-v="${v}" class="${String(F[k]) === String(v) ? 'on' : ''}">${l}</button>`).join('')}</div>`;
+  return `<div class="card">
+    <div class="filters">
+      <label>Market / region<select id="f-market">${marketOptions(F.market)}</select></label>
+      <label>Search<input id="f-q" placeholder="Ticker or name" value="${esc(F.q)}"></label>
+      <label>Min confidence<select id="f-conf">${[0, 50, 60, 70, 80].map(v => `<option value="${v}" ${F.conf == v ? 'selected' : ''}>${v ? v + '+' : 'Any'}</option>`).join('')}</select></label>
+      <label>Checklist score<select id="f-ck">${[0, 4, 5, 6].map(v => `<option value="${v}" ${F.ck == v ? 'selected' : ''}>${v ? v + '/6 or better' : 'Any'}</option>`).join('')}</select></label>
+      <label>Period<select id="f-days">${[[1, 'Last 24 h'], [3, '3 days'], [7, '7 days'], [14, '14 days']].map(([v, l]) => `<option value="${v}" ${F.days == v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
+      <label>Sort<select id="f-sort"><option value="conf" ${F.sort === 'conf' ? 'selected' : ''}>Confidence</option><option value="new" ${F.sort === 'new' ? 'selected' : ''}>Newest</option></select></label>
+    </div>
+    <div style="margin-top:6px">${segs('tier', [['all', 'All tiers'], ['primary', '⭐ Primary only'], ['A', '⭐ A'], ['B', '⭐ B'], ['S', '▫️ Sec.']])}</div>
+    <div style="margin-top:6px">${segs('action', [['all', 'All'], ['BUY', '🟢 BUY'], ['SELL', '🔴 SELL']])}</div>
+    <div class="mut small" style="margin-top:6px">⭐ <b>Primary A</b> = BUY + wide stop (≥1.5×ATR) · ⭐ <b>Primary B</b> = other BUYs · ▫️ Secondary = SELL (negative in 2022-26 backtests) · 🏆 = top pattern. Labels only.</div>
+  </div>
+  <div class="mut small" style="padding:0 4px">${rows.length} signals · ⭐ ${rows.filter(r => r.setup === 'A').length} A · ⭐ ${rows.filter(r => r.setup === 'B').length} B · <span class="BUY">${nb} BUY</span> · <span class="SELL">${ns} SELL</span></div>
+  ${rows.length ? rows.map(sigCard).join('') : `<div class="card empty mut">No signals match these filters. The checklist is strict on purpose.</div>`}`;
+}
+function tradeBadge(t) {
+  if (!t) return '';
+  const lab = { open: 'open', won: 'won ✅', lost: 'lost ❌', expired: 'expired' }[t.status] || t.status;
+  return `<span class="pill ${cls(t.pnl_pct)}">${lab} ${sgn(t.pnl_pct, 2, '%')}</span>`;
+}
+function tierBadge(s) {
+  if (!s.setup) return '';
+  return `<span class="tier tier-${s.setup}">${esc(s.badge)}</span>`;
+}
+function topTags(s) { return (s.top_patterns || []).map(t => `<span class="toppat">🏆 ${esc(t)}</span>`).join(' '); }
+function sigCard(s) {
+  return `<a class="card sig${s.tier === 'PRIMARY' ? ' prim' : ''}" href="#/s/${s.id}">
+    <div class="row sp small"><div>${tierBadge(s)} <span class="mut">${esc(s.setup_name || '')}</span></div>${s.stop_atr != null ? `<span class="mut">stop ${s.stop_atr}×ATR</span>` : ''}</div>
+    <div class="row sp"><div><span class="t">${s.flag} ${esc(s.ticker)}</span> <span class="pill ${s.action}">${s.action}</span> ${topTags(s)}</div>
+    <div class="small">conf <b>${s.confidence}</b> · ${s.checklist_pass}/6</div></div>
+    <div class="mut small">${esc((s.name || '').slice(0, 40))} · ${esc(s.exchange)} · ${esc(s.currency)}</div>
+    <div class="grid"><div><span>Entry</span><b>${px(s.entry)}</b></div><div><span>Stop</span><b class="dn">${px(s.stop)}</b></div><div><span>Target</span><b class="up">${px(s.target)}</b></div></div>
+    <div class="row sp small" style="margin-top:6px"><span class="mut">${esc(s.pattern || s.candle || '')}${s.candle_closed ? '' : ' · <i>provisional</i>'}</span><span>RRR ${s.rrr} ${tradeBadge(s.trade)}</span></div>
+    <div class="mut small">${fmtT(s.ts)}</div></a>`;
+}
+
+function viewDetail(id) {
+  const s = (D.signals || []).find(x => String(x.id) === String(id));
+  if (!s) return `<div class="card empty">Signal not found in the published data.</div>`;
+  const t = s.trade;
+  const f = s.fundamentals || {};
+  return `<div class="card">
+    <div class="row sp"><div class="big">${s.flag} ${esc(s.ticker)} <span class="${s.action}">${s.action}</span></div><div class="pill">conf ${s.confidence}</div></div>
+    <div class="row small" style="margin:4px 0">${tierBadge(s)} <b>${esc(s.setup_name || '')}</b> ${topTags(s)}</div>
+    <div class="mut small">${esc(s.name || '')} · ${esc(s.sector || '')}</div>
+    <div class="mut small">${esc(s.exchange)} (${s.market}) · prices in ${esc(s.currency)} · bar ${esc(s.bar_date)}${s.candle_closed ? '' : ' · <b>provisional</b> (candle not closed)'}</div>
+    <div class="grid"><div><span>Entry</span><b>${px(s.entry)}</b></div><div><span>Stop</span><b class="dn">${px(s.stop)}</b></div><div><span>Target</span><b class="up">${px(s.target)}</b></div>
+    <div><span>RRR</span><b>${s.rrr}</b></div><div><span>Checklist</span><b>${s.checklist_pass}/6</b></div><div><span>Fund score</span><b>${s.fund_score ?? '–'}</b></div></div>
+    <div class="mut small" style="margin-top:6px">Signalled ${fmtT(s.ts)}${s.rsi != null ? ' · RSI ' + s.rsi : ''}${s.atr != null ? ' · ATR ' + px(s.atr) : ''}</div>
+  </div>
+  <div class="card"><div class="row sp"><b>Chart</b><span class="mut small">daily · last 120 bars</span></div><div id="chart"></div>
+    <div class="small mut">Lines: <span style="color:#4ea1ff">entry</span>, <span class="dn">stop</span>, <span class="up">target</span>, dashed grey = support/resistance, dashed amber = supply/demand zones.</div></div>
+  <div class="card"><b>Paper trade</b>${t ? `
+    <div class="grid"><div><span>Status</span><b>${esc(t.status)}</b></div><div><span>PnL %</span><b class="${cls(t.pnl_pct)}">${sgn(t.pnl_pct, 2, '%')}</b></div><div><span>R</span><b class="${cls(t.r_mult)}">${sgn(t.r_mult, 2, 'R')}</b></div>
+    <div><span>PnL $</span><b class="${cls(t.pnl_usd)}">${usd(t.pnl_usd)}</b></div><div><span>${t.exit_price != null ? 'Exit' : 'Last'}</span><b>${px(t.exit_price ?? t.last_price)}</b></div><div><span>Sessions</span><b>${t.bars_held ?? 0}</b></div></div>
+    <div class="mut small" style="margin-top:4px">${t.exit_reason ? esc(t.exit_reason) + ' on ' + esc(t.closed_bar) : 'Last bar ' + esc(t.last_bar || '')} · $${num(D.pnl ? D.pnl.notional_usd : 1000, 0)} notional, expires after ${D.pnl ? D.pnl.expire_days : 10} sessions</div>` : '<div class="mut small">No paper trade yet.</div>'}</div>
+  <div class="card"><b>Zerodha Varsity checklist (${s.checklist_pass}/6)</b>
+    ${(s.checklist || []).map(c => `<div class="ck"><div>${c.pass ? '✅' : '❌'}</div><div><div class="small b">${c.n}. ${esc(c.item)}</div><div class="small mut">${esc(c.detail)}</div></div></div>`).join('')}</div>
+  <div class="card"><b>Why</b><ul class="small" style="padding-left:18px;margin:6px 0">${(s.reasons || []).map(r => `<li>${esc(r)}</li>`).join('')}</ul>
+    ${s.position_note ? `<div class="small mut">${esc(s.position_note)}</div>` : ''}</div>
+  <div class="card"><div class="row sp"><b>Fundamentals</b><span class="small">${f.score ?? '–'} · ${esc(f.verdict || 'n/a')}</span></div>
+    <table><tr><th>Metric</th><th>Value</th><th>Grade</th><th>Rule</th></tr>
+    ${(f.metrics || []).map(m => `<tr><td>${esc(m.metric)}</td><td>${esc(m.display)}</td><td class="${m.grade === 'buy' ? 'up' : m.grade === 'avoid' ? 'dn' : ''}">${esc(m.grade)}</td><td class="mut">${esc(m.rule || '')}</td></tr>`).join('')}</table>
+    ${(f.notes || []).map(n => `<div class="small mut">• ${esc(n)}</div>`).join('')}</div>
+  ${(s.levels || []).length ? `<div class="card"><b>Support / resistance</b><div class="small">${s.levels.map(l => `${px(l.price)} <span class="mut">(${l.touches}×)</span>`).join(' · ')}</div>
+  ${(s.zones || []).length ? `<div class="small mut" style="margin-top:4px">Zones: ${s.zones.map(z => `${z.type} ${z.pattern} ${px(z.distal)}–${px(z.proximal)}${z.fresh ? ' (fresh)' : ''}`).join(' · ')}</div>` : ''}</div>` : ''}
+  <div class="card btns"><button class="pri" data-cmd="/check ${esc(s.ticker)}">🔎 Live re-check ${esc(s.ticker)} in the bot</button>
+    <button data-cmd="/scan ${s.market}">🔄 Scan ${s.flag} ${s.market} now</button></div>`;
+}
+function css(v, d) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim() || d; }
+async function drawChart(s) {
+  const el = $('#chart'); if (!el || !window.LightweightCharts) return;
+  let bars;
+  try { bars = await fetch('data/' + s.chart + '?t=' + Date.now()).then(r => r.ok ? r.json() : null); } catch (e) {}
+  if (!bars || !bars.length) { el.innerHTML = '<div class="mut small empty">No chart data published for this ticker.</div>'; return; }
+  const tx = css('--tx', '#e6edf3'), sep = 'rgba(127,127,127,.15)';
+  const ch = LightweightCharts.createChart(el, { height: 300, width: el.clientWidth, layout: { background: { type: 'solid', color: 'transparent' }, textColor: tx, fontSize: 11 },
+    grid: { vertLines: { color: sep }, horzLines: { color: sep } }, rightPriceScale: { borderColor: sep }, timeScale: { borderColor: sep }, handleScroll: true, handleScale: true });
+  const c = ch.addCandlestickSeries({ upColor: '#16c784', downColor: '#ea3943', wickUpColor: '#16c784', wickDownColor: '#ea3943', borderVisible: false });
+  c.setData(bars);
+  const v = ch.addHistogramSeries({ priceFormat: { type: 'volume' }, priceScaleId: '', color: 'rgba(127,127,127,.35)' });
+  v.priceScale().applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+  v.setData(bars.map(b => ({ time: b.time, value: b.volume })));
+  const lo = Math.min(...bars.map(b => b.low)) * 0.85, hi = Math.max(...bars.map(b => b.high)) * 1.15;
+  const L = (p, col, title, style, w) => p != null && c.createPriceLine({ price: p, color: col, lineWidth: w || 2, lineStyle: style || 0, axisLabelVisible: true, title });
+  L(s.entry, '#4ea1ff', 'entry'); L(s.stop, '#ea3943', 'stop'); L(s.target, '#16c784', 'target');
+  (s.levels || []).filter(l => l.price > lo && l.price < hi).forEach(l => L(l.price, '#8b98a5', 'S/R ' + l.touches + '×', 2, 1));
+  (s.zones || []).filter(z => z.proximal > lo && z.proximal < hi).slice(0, 4).forEach(z => L(z.proximal, '#e3b341', z.type, 1, 1));
+  const bd = bars.find(b => b.time === s.bar_date);
+  if (bd) c.setMarkers([{ time: s.bar_date, position: s.action === 'BUY' ? 'belowBar' : 'aboveBar', color: s.action === 'BUY' ? '#16c784' : '#ea3943', shape: s.action === 'BUY' ? 'arrowUp' : 'arrowDown', text: s.action }]);
+  ch.timeScale().fitContent();
+  new ResizeObserver(() => ch.applyOptions({ width: el.clientWidth })).observe(el);
+}
+
+/* PnL: aggregated client-side from trades.json with the same rules as app/pnl.py */
+const P = Object.assign({ period: 'all', market: 'all' }, LS.get('pnlf', {}));
+function periodStart(p) {
+  const today = lagosDate(new Date());
+  if (p === 'today') return today;
+  const [y, m, d] = today.split('-').map(Number), dt = new Date(Date.UTC(y, m - 1, d));
+  if (p === 'week') { dt.setUTCDate(dt.getUTCDate() - ((dt.getUTCDay() + 6) % 7)); return dt.toISOString().slice(0, 10); }
+  if (p === 'month') return today.slice(0, 8) + '01';
+  return '0000-00-00';
+}
+function stats(rows) {
+  const closed = rows.filter(r => r.status !== 'open'), won = closed.filter(r => r.status === 'won');
+  const sum = (a, k) => a.reduce((x, r) => x + (r[k] || 0), 0);
+  const o = { closed: closed.length, won: won.length, lost: closed.filter(r => r.status === 'lost').length, expired: closed.filter(r => r.status === 'expired').length,
+    win_rate: closed.length ? 100 * won.length / closed.length : null, realized: sum(closed, 'pnl_usd'), avg_r: closed.length ? sum(closed, 'r_mult') / closed.length : null, sum_r: sum(closed, 'r_mult') };
+  if (closed.length) { const s = [...closed].sort((a, b) => b.pnl_pct - a.pnl_pct); o.best = s[0]; o.worst = s[s.length - 1]; }
+  return o;
+}
+function viewPnl() {
+  const start = periodStart(P.period);
+  const all = (D.trades || []).filter(t => marketMatch(t.market, P.market));
+  const closed = all.filter(t => t.status !== 'open' && (t.closed_bar || '') >= start), open = all.filter(t => t.status === 'open');
+  const S = stats(closed), unreal = open.reduce((x, r) => x + (r.pnl_usd || 0), 0), unrealR = open.reduce((x, r) => x + (r.r_mult || 0), 0);
+  const group = k => [...new Set(all.map(t => t[k]))].sort().map(v => { const c = closed.filter(t => t[k] === v), o = open.filter(t => t[k] === v); return [v, stats(c), o.length, o.reduce((x, r) => x + (r.pnl_usd || 0), 0)]; });
+  const gtable = (title, rows, lab) => `<div class="card"><b>${title}</b><table><tr><th></th><th class="r">Closed</th><th class="r">Win %</th><th class="r">Avg R</th><th class="r">Realised</th><th class="r">Open</th><th class="r">Unreal.</th></tr>
+    ${rows.map(([v, s, no, ou]) => `<tr><td>${lab(v)}</td><td class="r">${s.closed}</td><td class="r">${s.win_rate == null ? '–' : num(s.win_rate, 0)}</td><td class="r ${cls(s.avg_r)}">${s.avg_r == null ? '–' : sgn(s.avg_r)}</td><td class="r ${cls(s.realized)}">${usd(s.realized)}</td><td class="r">${no}</td><td class="r ${cls(ou)}">${usd(ou)}</td></tr>`).join('')}</table></div>`;
+  const per = [['today', 'Today'], ['week', 'Week'], ['month', 'Month'], ['all', 'All-time']];
+  const tl = (list, empty) => list.length ? `<table><tr><th>Ticker</th><th>Side</th><th class="r">Entry→Px</th><th class="r">%</th><th class="r">R</th><th class="r">$</th></tr>${list.map(t => {
+    const sig = (D.signals || []).find(s => s.id === t.signal_id); const m = M()[t.market] || {};
+    return `<tr><td>${m.flag || ''} ${sig ? `<a href="#/s/${t.signal_id}">${esc(t.ticker)}</a>` : esc(t.ticker)}<div class="mut small">${esc(t.status)}${t.closed_bar ? ' ' + esc(t.closed_bar) : ''}</div></td><td class="${t.side}">${t.side}</td>
+    <td class="r">${px(t.entry)}→${px(t.exit_price ?? t.last_price)}<div class="mut small">${esc(t.currency)}</div></td><td class="r ${cls(t.pnl_pct)}">${sgn(t.pnl_pct, 1)}</td><td class="r ${cls(t.r_mult)}">${sgn(t.r_mult)}</td><td class="r ${cls(t.pnl_usd)}">${usd(t.pnl_usd)}</td></tr>`; }).join('')}</table>` : `<div class="mut small">${empty}</div>`;
+  return `<div class="card"><div class="seg">${per.map(([v, l]) => `<button data-p="${v}" class="${P.period === v ? 'on' : ''}">${l}</button>`).join('')}</div>
+    <div style="margin-top:6px"><select id="p-market" style="width:100%">${marketOptions(P.market)}</select></div></div>
+  <div class="card"><div class="mut small">${per.find(x => x[0] === P.period)[1]} realised${P.period !== 'all' ? ' (closed since ' + start + ')' : ''}</div>
+    <div class="big ${cls(S.realized)}">${usd(S.realized)}</div>
+    <div class="grid"><div><span>Closed</span><b>${S.closed}</b></div><div><span>Win rate</span><b>${S.win_rate == null ? '–' : num(S.win_rate, 1) + '%'}</b></div><div><span>Avg R</span><b class="${cls(S.avg_r)}">${S.avg_r == null ? '–' : sgn(S.avg_r)}</b></div>
+    <div><span>Won / lost</span><b>${S.won} / ${S.lost}</b></div><div><span>Expired</span><b>${S.expired}</b></div><div><span>Total R</span><b class="${cls(S.sum_r)}">${sgn(S.sum_r)}</b></div>
+    <div><span>Open trades</span><b>${open.length}</b></div><div><span>Unrealised</span><b class="${cls(unreal)}">${usd(unreal)}</b></div><div><span>Open R</span><b class="${cls(unrealR)}">${sgn(unrealR)}</b></div></div>
+    ${S.best ? `<div class="small" style="margin-top:6px">Best <b>${esc(S.best.ticker)}</b> <span class="up">${sgn(S.best.pnl_pct, 2, '%')}</span> · worst <b>${esc(S.worst.ticker)}</b> <span class="dn">${sgn(S.worst.pnl_pct, 2, '%')}</span></div>` : ''}
+    <div class="mut small" style="margin-top:4px">Each signal = $${num(D.pnl ? D.pnl.notional_usd : 1000, 0)} paper trade; stop assumed first if both hit; expires after ${D.pnl ? D.pnl.expire_days : 10} sessions. No costs or slippage.</div></div>
+  ${gtable('BUY vs SELL', group('side'), v => `<span class="${v}">${v}</span>`)}
+  ${gtable('By market', group('market'), v => `${(M()[v] || {}).flag || ''} ${v}`)}
+  <div class="card"><b>Open trades (${open.length})</b>${tl(open.sort((a, b) => (b.pnl_usd || 0) - (a.pnl_usd || 0)), 'No open trades.')}</div>
+  <div class="card"><b>Closed in period (${closed.length})</b>${tl(closed.sort((a, b) => (b.closed_bar || '').localeCompare(a.closed_bar || '')), 'No trades closed in this period yet.')}</div>
+  <div class="card btns"><button data-cmd="/pnl ${P.period}${P.market !== 'all' && !REGIONS.includes(P.market) ? ' ' + P.market : P.market === 'Europe' ? ' europe' : P.market === 'Asia-Pacific' ? ' asia' : ''}">Get this PnL report in the chat</button></div>`;
+}
+
+function viewMarkets() {
+  const now = new Date().toISOString();
+  const next = ((D.schedule && D.schedule.next) || []).filter(x => x.utc > now).slice(0, 12);
+  const sub = LS.get('sub', []);
+  return `<div class="card"><b>Next scheduled scans</b> <span class="mut small">(Lagos time, WAT = UTC+1)</span>
+    ${next.length ? `<table>${next.map(x => `<tr><td>${x.flag} ${x.market}</td><td>${fmtT(x.utc)}</td><td class="mut small">${esc(x.kind)}</td><td class="r small">${until(x.utc)}</td></tr>`).join('')}</table>` : '<div class="mut small">Schedule data is stale; it refreshes on the next publish.</div>'}</div>
+  <div class="card"><b>Markets & sessions</b> <span class="mut small">status as of last update</span>
+    <table><tr><th>Market</th><th>Status</th><th>Scan slots (Lagos)</th></tr>
+    ${((D.schedule && D.schedule.markets) || []).map(m => { const st = M()[m.code] || {}; return `<tr><td>${m.flag} <b>${m.code}</b><div class="mut small">${esc(m.exchange)} · ${esc(st.currency || '')}</div></td>
+      <td class="small">${st.open ? '<span class="up">OPEN</span>' : st.holiday ? 'holiday' : 'closed'}<div class="mut">${esc(st.local_time || '')}</div></td>
+      <td class="small">${esc(m.day)}: ${m.lagos.join(', ')}<div class="mut">local ${m.local.join(', ')}</div></td></tr>`; }).join('')}</table>
+    <div class="mut small">Hourly during each market's own session + a post-close check; weekends and exchange holidays skipped. Europe moves 1 h later in Lagos from 25 Oct, the US from 1 Nov.</div></div>
+  <div class="card"><b>Last scans</b><table>${((D.status && D.status.last_scans) || []).sort((a, b) => (b.finished || '').localeCompare(a.finished || '')).map(s => `<tr><td>${(M()[s.market] || {}).flag || ''} ${s.market}</td><td class="small">${s.finished ? fmtT(s.finished) : ''}</td><td class="r small">${s.n_buy}B / ${s.n_sell}S of ${s.n_eligible}</td></tr>`).join('')}</table></div>
+  <div class="card"><b>Push alerts</b><div class="mut small">Choose markets, then confirm in the chat. Leave all unticked for every market.</div>
+    <div class="row" style="margin:6px 0">${Object.values(M()).map(m => `<label class="small"><input type="checkbox" class="subm" value="${m.code}" ${sub.includes(m.code) ? 'checked' : ''}> ${m.flag} ${m.code}</label>`).join('')}</div>
+    <div class="btns"><button class="pri" id="do-sub">🔔 Subscribe</button><button data-cmd="/unsubscribe">🔕 Unsubscribe</button></div></div>`;
+}
+
+function viewActions() {
+  return `<div class="card"><b>🔎 Check a ticker</b><div class="mut small">Runs the full live analysis in the bot (Yahoo symbols: AAPL, 7203.T, BP.L, 0700.HK, RELIANCE.NS).</div>
+    <div class="row" style="margin-top:6px"><input id="a-t" placeholder="Ticker" style="flex:1;text-transform:uppercase"><button class="pri" id="a-check">Check</button></div></div>
+  <div class="card"><b>🔄 Scan now</b><div class="row" style="margin-top:6px"><select id="a-m" style="flex:1"><option value="US">🇺🇸 US</option><option value="europe">🌍 Europe</option><option value="asia">🌏 Asia-Pacific</option><option value="all">All markets</option>
+    ${Object.values(M()).filter(m => m.code !== 'US').map(m => `<option value="${m.code}">${m.flag} ${m.code}</option>`).join('')}</select><button class="pri" id="a-scan">Scan</button></div></div>
+  <div class="card btns"><b>In the chat</b><button data-cmd="/signals">Latest signals</button><button data-cmd="/trades open">Open trades</button><button data-cmd="/status">Market status & next scans</button></div>
+  <div class="card mut small">Actions are sent to @${esc((D.status || {}).bot_username || 'StockingTradeBot')} as chat commands; the reply appears in the chat. This app itself is a static page: its data refreshes after each scan (at most every 10 min), so it may lag the bot by a few minutes.</div>`;
+}
+
+function mdToHtml(md) {
+  const inl = s => esc(s).replace(/\*\*(.+?)\*\*/g, '<b>$1</b>').replace(/`([^`]+)`/g, '<code>$1</code>').replace(/\*(.+?)\*/g, '<i>$1</i>');
+  const out = []; const L = md.split('\n'); let i = 0;
+  while (i < L.length) {
+    const l = L[i];
+    if (/^\s*\|/.test(l)) { const t = []; while (i < L.length && /^\s*\|/.test(L[i])) t.push(L[i++]);
+      const cells = r => r.trim().replace(/^\||\|$/g, '').split('|').map(c => c.trim());
+      out.push('<table>' + t.filter(r => !/^\s*\|[\s:|-]+\|\s*$/.test(r)).map((r, k) => '<tr>' + cells(r).map(c => k ? `<td>${inl(c)}</td>` : `<th>${inl(c)}</th>`).join('') + '</tr>').join('') + '</table>'); continue; }
+    if (/^#{1,6}\s/.test(l)) { out.push(`<h3>${inl(l.replace(/^#+\s*/, ''))}</h3>`); i++; continue; }
+    if (/^\s*[-*]\s/.test(l)) { const it = []; while (i < L.length && /^\s*[-*]\s/.test(L[i])) it.push(`<li>${inl(L[i++].replace(/^\s*[-*]\s/, ''))}</li>`); out.push('<ul>' + it.join('') + '</ul>'); continue; }
+    if (/^!\[/.test(l)) { i++; continue; }
+    if (l.trim()) out.push(`<p>${inl(l)}</p>`);
+    i++;
+  }
+  return out.join('');
+}
+function viewBacktest() {
+  const B = D.backtest;
+  if (!B || !B.available) return `<div class="card empty mut">No backtest results published yet.</div>`;
+  const row = (lab, s) => `<tr><td>${lab}</td><td class="r">${s.trades}</td><td class="r">${s.win_rate ?? '–'}%</td><td class="r ${cls(s.avg_r)}">${s.avg_r ?? '–'}</td><td class="r ${cls(s.pnl_usd)}">${usd(s.pnl_usd)}</td></tr>`;
+  return `<div class="card warn small">Historical simulation of the current rules (read-only results). Past results don't predict future returns; see the report's bias notes.</div>
+  ${B.windows.map(w => `<div class="card"><b>Window ${esc(w.window === 'out' ? 'last 12 months' : w.window.replace(/^out_?/, ''))}</b> <span class="mut small">${esc(w.from)} → ${esc(w.to)}</span>
+    <table><tr><th></th><th class="r">Trades</th><th class="r">Win</th><th class="r">Avg R</th><th class="r">PnL</th></tr>${row('All', w.all)}${Object.entries(w.by_side).map(([k, s]) => row(`<span class="${k}">${k}</span>`, s)).join('')}</table>
+    ${w.benchmarks && w.benchmarks.US ? `<div class="small mut">Benchmark ${esc(w.benchmarks.US.index)} buy & hold: <b class="${cls(w.benchmarks.US.ret_pct)}">${sgn(w.benchmarks.US.ret_pct, 2, '%')}</b></div>` : ''}
+    <details><summary class="small">By market</summary><table>${Object.entries(w.by_market).map(([k, s]) => row(((M()[k] || {}).flag || '') + ' ' + k, s)).join('')}</table></details></div>`).join('')}
+  ${B.images.map(im => `<div class="card"><img src="${im}?t=${Date.now()}" alt="equity curve" loading="lazy"></div>`).join('')}
+  ${B.reports.map(r => `<div class="card md"><details><summary><b>${esc(r.name)}</b> <span class="mut small">${fmtT(r.updated)}</span></summary>${mdToHtml(r.markdown)}</details></div>`).join('')}`;
+}
+
+/* ---------------- router ---------------- */
+function render() {
+  const h = location.hash || '#/signals';
+  const [, tab, arg] = h.split('/');
+  document.querySelectorAll('#tabs a').forEach(a => a.classList.toggle('on', a.dataset.tab === (tab === 's' ? 'signals' : tab)));
+  const v = $('#view');
+  backButton(tab === 's');
+  mainButton(null);
+  try {
+    if (tab === 's') {
+      v.innerHTML = viewDetail(arg);
+      const s = (D.signals || []).find(x => String(x.id) === String(arg));
+      if (s) { drawChart(s); mainButton(`Live check ${s.ticker} in bot`, () => botCmd('/check ' + s.ticker)); }
+    } else if (tab === 'pnl') v.innerHTML = viewPnl();
+    else if (tab === 'markets') { v.innerHTML = viewMarkets(); }
+    else if (tab === 'backtest') v.innerHTML = viewBacktest();
+    else if (tab === 'actions') v.innerHTML = viewActions();
+    else v.innerHTML = viewSignals();
+  } catch (e) { v.innerHTML = `<div class="card dn">Render error: ${esc(e.message)}</div>`; console.error(e); }
+  if (tab !== 's') window.scrollTo(0, 0);
+}
+document.addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b) return;
+  if (b.dataset.cmd) return botCmd(b.dataset.cmd);
+  if (b.dataset.f) { F[b.dataset.f] = b.dataset.v; LS.set('filters', F); return render(); }
+  if (b.dataset.p) { P.period = b.dataset.p; LS.set('pnlf', P); return render(); }
+  if (b.id === 'do-sub') { const c = [...document.querySelectorAll('.subm:checked')].map(x => x.value); LS.set('sub', c); return botCmd('/subscribe' + (c.length ? ' ' + c.join(' ') : '')); }
+  if (b.id === 'a-check') { const t = ($('#a-t').value || '').trim().toUpperCase(); if (!t) return toast('Type a ticker first'); return botCmd('/check ' + t); }
+  if (b.id === 'a-scan') return botCmd('/scan ' + $('#a-m').value);
+});
+document.addEventListener('change', e => {
+  const id = e.target.id;
+  const map = { 'f-market': 'market', 'f-conf': 'conf', 'f-ck': 'ck', 'f-days': 'days', 'f-sort': 'sort' };
+  if (map[id]) { F[map[id]] = ['conf', 'ck', 'days'].includes(map[id]) ? Number(e.target.value) : e.target.value; LS.set('filters', F); render(); }
+  if (id === 'p-market') { P.market = e.target.value; LS.set('pnlf', P); render(); }
+});
+let qT; document.addEventListener('input', e => { if (e.target.id === 'f-q') { clearTimeout(qT); qT = setTimeout(() => { F.q = e.target.value; LS.set('filters', F); render(); const q = $('#f-q'); q.focus(); q.setSelectionRange(q.value.length, q.value.length); }, 350); } });
+document.addEventListener('keydown', e => { if (e.key === 'Enter' && e.target.id === 'a-t') $('#a-check').click(); });
+window.addEventListener('hashchange', render);
+load().then(() => {
+  const sp = tg && tg.initDataUnsafe && tg.initDataUnsafe.start_param;
+  if (sp && /^s\d+$/.test(sp)) location.hash = '#/s/' + sp.slice(1);
+  render();
+}).catch(e => { $('#view').innerHTML = `<div class="card empty">Couldn't load data: ${esc(e.message)}</div>`; });
+setInterval(() => load().then(() => { if (!location.hash.startsWith('#/s/') && !document.activeElement.matches('input,select')) render(); }).catch(() => {}), 5 * 60 * 1000);
